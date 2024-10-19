@@ -11,12 +11,18 @@ from einops import rearrange, repeat
 from backend.attention import attention_function
 from backend.utils import fp16_fix, tensor2parameter
 
+# Import Triton kernels if available
+try:
+    import triton
+    from triton_kernels.flux import DoubleStreamBlock as TritonDoubleStreamBlock, SingleStreamBlock as TritonSingleStreamBlock
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
 
 def attention(q, k, v, pe):
     q, k = apply_rope(q, k, pe)
     x = attention_function(q, k, v, q.shape[1], skip_reshape=True)
     return x
-
 
 def rope(pos, dim, theta):
     if pos.device.type == "mps" or pos.device.type == "xpu":
@@ -25,7 +31,6 @@ def rope(pos, dim, theta):
         scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / (theta ** scale)
 
-    # out = torch.einsum("...n,d->...nd", pos, omega)
     out = pos.unsqueeze(-1) * omega.unsqueeze(0)
 
     cos_out = torch.cos(out)
@@ -33,12 +38,10 @@ def rope(pos, dim, theta):
     out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
     del cos_out, sin_out
 
-    # out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
     b, n, d, _ = out.shape
     out = out.view(b, n, d, 2, 2)
 
     return out.float()
-
 
 def apply_rope(xq, xk, freqs_cis):
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -48,18 +51,11 @@ def apply_rope(xq, xk, freqs_cis):
     del xq_, xk_
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
-
 def timestep_embedding(t, dim, max_period=10000, time_factor=1000.0):
     t = time_factor * t
     half = dim // 2
 
-    # TODO: Once A trainer for flux get popular, make timestep_embedding consistent to that trainer
-
-    # Do not block CUDA steam, but having about 1e-4 differences with Flux official codes:
     freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
-
-    # Block CUDA steam, but consistent with official codes:
-    # freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(t.device)
 
     args = t[:, None].float() * freqs[None]
     del freqs
@@ -70,7 +66,6 @@ def timestep_embedding(t, dim, max_period=10000, time_factor=1000.0):
     if torch.is_floating_point(t):
         embedding = embedding.to(t)
     return embedding
-
 
 class EmbedND(nn.Module):
     def __init__(self, dim, theta, axes_dim):
@@ -88,7 +83,6 @@ class EmbedND(nn.Module):
         del ids, n_axes
         return emb.unsqueeze(1)
 
-
 class MLPEmbedder(nn.Module):
     def __init__(self, in_dim, hidden_dim):
         super().__init__()
@@ -100,7 +94,6 @@ class MLPEmbedder(nn.Module):
         x = self.silu(self.in_layer(x))
         return self.out_layer(x)
 
-
 if hasattr(torch, 'rms_norm'):
     functional_rms_norm = torch.rms_norm
 else:
@@ -111,11 +104,10 @@ else:
             n = torch.rsqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True) + eps).to(x.dtype) * weight
         return x * n
 
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.weight = None  # to trigger module_profile
+        self.weight = None
         self.scale = nn.Parameter(torch.ones(dim))
         self.eps = 1e-6
         self.normalized_shape = [dim]
@@ -124,7 +116,6 @@ class RMSNorm(nn.Module):
         if self.scale.dtype != x.dtype:
             self.scale = tensor2parameter(self.scale.to(dtype=x.dtype))
         return functional_rms_norm(x, self.normalized_shape, self.scale, self.eps)
-
 
 class QKNorm(nn.Module):
     def __init__(self, dim):
@@ -138,7 +129,6 @@ class QKNorm(nn.Module):
         k = self.key_norm(k)
         return q.to(k), k.to(q)
 
-
 class SelfAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False):
         super().__init__()
@@ -150,8 +140,6 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, pe):
         qkv = self.qkv(x)
-
-        # q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         B, L, _ = qkv.shape
         qkv = qkv.view(B, L, 3, self.num_heads, -1)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
@@ -165,7 +153,6 @@ class SelfAttention(nn.Module):
         x = self.proj(x)
         return x
 
-
 class Modulation(nn.Module):
     def __init__(self, dim, double):
         super().__init__()
@@ -176,7 +163,6 @@ class Modulation(nn.Module):
     def forward(self, vec):
         out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
         return out
-
 
 class DoubleStreamBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio, qkv_bias=False):
@@ -212,7 +198,6 @@ class DoubleStreamBlock(nn.Module):
         img_qkv = self.img_attn.qkv(img_modulated)
         del img_modulated
 
-        # img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         B, L, _ = img_qkv.shape
         H = self.num_heads
         D = img_qkv.shape[-1] // (3 * H)
@@ -230,7 +215,6 @@ class DoubleStreamBlock(nn.Module):
         txt_qkv = self.txt_attn.qkv(txt_modulated)
         del txt_modulated
 
-        # txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         B, L, _ = txt_qkv.shape
         txt_q, txt_k, txt_v = txt_qkv.view(B, L, 3, H, D).permute(2, 0, 3, 1, 4)
         del txt_qkv
@@ -263,7 +247,6 @@ class DoubleStreamBlock(nn.Module):
 
         return img, txt
 
-
 class SingleStreamBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, qk_scale=None):
         super().__init__()
@@ -288,7 +271,6 @@ class SingleStreamBlock(nn.Module):
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
         del x_mod
 
-        # q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         qkv = qkv.view(qkv.size(0), qkv.size(1), 3, self.num_heads, self.hidden_size // self.num_heads)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
         del qkv
@@ -306,7 +288,6 @@ class SingleStreamBlock(nn.Module):
 
         return x
 
-
 class LastLayer(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -321,7 +302,6 @@ class LastLayer(nn.Module):
         del scale, shift
         x = self.linear(x)
         return x
-
 
 class IntegratedFluxTransformer2DModel(nn.Module):
     def __init__(self, in_channels: int, vec_in_dim: int, context_in_dim: int, hidden_size: int, mlp_ratio: float, num_heads: int, depth: int, depth_single_blocks: int, axes_dim: list[int], theta: int, qkv_bias: bool, guidance_embed: bool):
@@ -350,19 +330,16 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         self.double_blocks = nn.ModuleList(
             [
-                DoubleStreamBlock(
-                    self.hidden_size,
-                    self.num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                )
+                TritonDoubleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias)
+                if TRITON_AVAILABLE else DoubleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias)
                 for _ in range(depth)
             ]
         )
 
         self.single_blocks = nn.ModuleList(
             [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio)
+                TritonSingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio)
+                if TRITON_AVAILABLE else SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio)
                 for _ in range(depth_single_blocks)
             ]
         )
@@ -386,37 +363,4 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         pe = self.pe_embedder(ids)
         del ids
         for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
-        del pe
-        img = img[:, txt.shape[1]:, ...]
-        del txt
-        img = self.final_layer(img, vec)
-        del vec
-        return img
-
-    def forward(self, x, timestep, context, y, guidance=None, **kwargs):
-        bs, c, h, w = x.shape
-        input_device = x.device
-        input_dtype = x.dtype
-        patch_size = 2
-        pad_h = (patch_size - x.shape[-2] % patch_size) % patch_size
-        pad_w = (patch_size - x.shape[-1] % patch_size) % patch_size
-        x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="circular")
-        img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
-        del x, pad_h, pad_w
-        h_len = ((h + (patch_size // 2)) // patch_size)
-        w_len = ((w + (patch_size // 2)) // patch_size)
-        img_ids = torch.zeros((h_len, w_len, 3), device=input_device, dtype=input_dtype)
-        img_ids[..., 1] = img_ids[..., 1] + torch.linspace(0, h_len - 1, steps=h_len, device=input_device, dtype=input_dtype)[:, None]
-        img_ids[..., 2] = img_ids[..., 2] + torch.linspace(0, w_len - 1, steps=w_len, device=input_device, dtype=input_dtype)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
-        txt_ids = torch.zeros((bs, context.shape[1], 3), device=input_device, dtype=input_dtype)
-        del input_device, input_dtype
-        out = self.inner_forward(img, img_ids, context, txt_ids, timestep, y, guidance)
-        del img, img_ids, txt_ids, timestep, context
-        out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:, :, :h, :w]
-        del h_len, w_len, bs
-        return out
+            img, txt = block(img=img, txt
