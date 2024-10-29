@@ -16,18 +16,6 @@ from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
 
-import modules.shared as shared
-from modules import sd_samplers, deepbooru, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers
-from modules.api import models
-from modules.shared import opts
-from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images, process_extra_images
-from modules.textual_inversion.textual_inversion import create_embedding
-from PIL import PngImagePlugin
-from modules.realesrgan_model import get_realesrgan_models
-from modules import devices
-from typing import Any, Union, get_origin, get_args
-import piexif
-import piexif.helper
 import backend.memory_management as memory_management
 import backend.attention as attention
 from backend.diffusion_engine.base import ForgeDiffusionEngine
