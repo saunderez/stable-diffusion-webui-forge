@@ -28,6 +28,16 @@ from modules import devices
 from typing import Any, Union, get_origin, get_args
 import piexif
 import piexif.helper
+import backend.memory_management as memory_management
+import backend.attention as attention
+from backend.diffusion_engine.base import ForgeDiffusionEngine
+from backend.diffusion_engine.sd15 import StableDiffusion
+from backend.diffusion_engine.sd20 import StableDiffusion2
+from backend.diffusion_engine.sd35 import StableDiffusion3
+from backend.diffusion_engine.sdxl import StableDiffusionXL
+from backend.diffusion_engine.flux import Flux
+from backend.loader import load_huggingface_component
+
 from contextlib import closing
 from modules.progress import create_task_id, add_task_to_queue, start_task, finish_task, current_task
 

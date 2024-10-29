@@ -36,7 +36,25 @@ class ForgeDiffusionEngine:
         self.fix_for_webui_backward_compatibility()
 
     def set_clip_skip(self, clip_skip):
-        pass
+        self.text_processing_engine.clip_skip = clip_skip
+
+    @torch.inference_mode()
+    def get_learned_conditioning(self, prompt: list[str]):
+        memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+        cond = self.text_processing_engine(prompt)
+        return cond
+
+    @torch.inference_mode()
+    def encode_first_stage(self, x):
+        sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
+        sample = self.forge_objects.vae.first_stage_model.process_in(sample)
+        return sample.to(x)
+
+    @torch.inference_mode()
+    def decode_first_stage(self, x):
+        sample = self.forge_objects.vae.first_stage_model.process_out(x)
+        sample = self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
+        return sample.to(x)
 
     def get_first_stage_encoding(self, x):
         return x  # legacy code, do not change
