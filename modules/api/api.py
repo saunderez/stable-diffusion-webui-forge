@@ -25,6 +25,7 @@ from backend.diffusion_engine.sd35 import StableDiffusion3
 from backend.diffusion_engine.sdxl import StableDiffusionXL
 from backend.diffusion_engine.flux import Flux
 from backend.loader import load_huggingface_component
+from backend.utils import decode_base64_to_image, encode_pil_to_base64
 
 from contextlib import closing
 from modules.progress import create_task_id, add_task_to_queue, start_task, finish_task, current_task
@@ -68,64 +69,6 @@ def verify_url(url):
         return False
 
     return True
-
-
-def decode_base64_to_image(encoding):
-    if encoding.startswith("http://") or encoding.startswith("https://"):
-        if not opts.api_enable_requests:
-            raise HTTPException(status_code=500, detail="Requests not allowed")
-
-        if opts.api_forbid_local_requests and not verify_url(encoding):
-            raise HTTPException(status_code=500, detail="Request to local resource not allowed")
-
-        headers = {'user-agent': opts.api_useragent} if opts.api_useragent else {}
-        response = requests.get(encoding, timeout=30, headers=headers)
-        try:
-            image = images.read(BytesIO(response.content))
-            return image
-        except Exception as e:
-            raise HTTPException(status_code=500, detail="Invalid image url") from e
-
-    if encoding.startswith("data:image/"):
-        encoding = encoding.split(";")[1].split(",")[1]
-    try:
-        image = images.read(BytesIO(base64.b64decode(encoding)))
-        return image
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Invalid encoded image") from e
-
-
-def encode_pil_to_base64(image):
-    with io.BytesIO() as output_bytes:
-        if isinstance(image, str):
-            return image
-        if opts.samples_format.lower() == 'png':
-            use_metadata = False
-            metadata = PngImagePlugin.PngInfo()
-            for key, value in image.info.items():
-                if isinstance(key, str) and isinstance(value, str):
-                    metadata.add_text(key, value)
-                    use_metadata = True
-            image.save(output_bytes, format="PNG", pnginfo=(metadata if use_metadata else None), quality=opts.jpeg_quality)
-
-        elif opts.samples_format.lower() in ("jpg", "jpeg", "webp"):
-            if image.mode in ("RGBA", "P"):
-                image = image.convert("RGB")
-            parameters = image.info.get('parameters', None)
-            exif_bytes = piexif.dump({
-                "Exif": { piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(parameters or "", encoding="unicode") }
-            })
-            if opts.samples_format.lower() in ("jpg", "jpeg"):
-                image.save(output_bytes, format="JPEG", exif = exif_bytes, quality=opts.jpeg_quality)
-            else:
-                image.save(output_bytes, format="WEBP", exif = exif_bytes, quality=opts.jpeg_quality)
-
-        else:
-            raise HTTPException(status_code=500, detail="Invalid image format")
-
-        bytes_data = output_bytes.getvalue()
-
-    return base64.b64encode(bytes_data)
 
 
 def api_middleware(app: FastAPI):
